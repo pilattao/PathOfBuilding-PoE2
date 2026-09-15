@@ -59,7 +59,7 @@ do
 end
 
 -- API version (semantic versioning)
-local API_VERSION = "1.2.0"
+local API_VERSION = "1.3.0"
 
 local function version_meta()
   return {
@@ -68,7 +68,7 @@ local function version_meta()
     platform    = _G.launch and launch.versionPlatform or '?',
     apiVersion  = API_VERSION,
     game        = "poe2",
-    features    = { queuedBuildOpen = true },
+    features    = { queuedBuildOpen = true, nativeGemEvaluation = true },
   }
 end
 
@@ -217,6 +217,12 @@ handlers.get_gem_detail = function(params)
   local gem, err = BuildOps.get_gem_detail(params or {})
   if not gem then return { ok = false, error = err } end
   return { ok = true, gem = gem }
+end
+
+handlers.evaluate_gem_setups = function(params)
+  local result, err = BuildOps.evaluate_gem_setups(params or {})
+  if not result then return {ok=false,error=err} end
+  return {ok=true,result=result}
 end
 
 handlers.update_tree_delta = function(params)

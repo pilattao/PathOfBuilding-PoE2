@@ -119,6 +119,18 @@ function M.export_stats(fields)
       -- PoB2 stores selected-minion stats in mainOutput.Minion.
       local stat = k:sub(7)
       result[k] = output.Minion and output.Minion[stat]
+    elseif k == 'CharmLimit' then
+      -- CalcPerform stores this output only when a breakdown is requested.
+      -- Use the same native MAIN modifier calculation, including quest/tree
+      -- modifiers and overrides, rather than counting the belt's printed slots.
+      local env = build.calcsTab.mainEnv
+      local db = env and env.modDB
+      if db and db.Override and db.Sum then
+        local limit = db:Override(nil, 'CharmLimit') or db:Sum('BASE', nil, 'CharmLimit')
+        if type(limit) == 'number' and limit == limit and limit ~= math.huge and limit ~= -math.huge then
+          result[k] = math.min(limit, NUM_CHARM_SLOTS)
+        end
+      end
     end
   end
   -- include some metadata if available
@@ -905,6 +917,18 @@ local function resolve_gem(name)
   end
   if not found then return nil, 'gem not found: ' .. name end
   return found
+end
+
+-- Isolated native gem comparisons; support the same external dofile deployment as Handlers.
+local gemEvaluator
+function M.evaluate_gem_setups(params)
+  if not gemEvaluator then
+    local source = debug and debug.getinfo and debug.getinfo(1, 'S').source or ''
+    gemEvaluator = source:sub(1,1) == '@'
+      and dofile(source:sub(2):gsub('[^/\\]+$', '') .. 'GemEvaluator.lua')
+      or require('API.GemEvaluator')
+  end
+  return gemEvaluator.evaluate(build, params, {resolveGem=resolve_gem, getOutput=M.get_main_output})
 end
 
 local function gem_values(params, gem)
@@ -2057,7 +2081,7 @@ function M.generate_weighted_trade_query(params)
   -- Do not accept PoE1 influence/scourge/eldritch/synthesis filters as silent no-ops.
   local options = {includeCorrupted=false,includeMirrored=false,includeRunes=false,jewelType='Base',statWeights=weights}
   local allowed = {includeCorrupted=true,includeMirrored=true,includeRunes=true,jewelType=true,
-    statWeights=true,maxPrice=true,maxPriceType=true,maxLevel=true,sockets=true,requiredMods=true,account=true,special=true}
+    statWeights=true,maxPrice=true,maxPriceType=true,maxLevel=true,sockets=true,requiredMods=true,blockedMods=true,account=true,special=true}
   local poe1 = {influence1=true,influence2=true,includeScourge=true,includeEldritch=true,includeSynthesis=true}
   for k,v in pairs(params.options or {}) do
     if poe1[k] then return nil, 'PoE1 trade option has no PoE2 counterpart: ' .. k end
