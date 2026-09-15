@@ -474,7 +474,7 @@ holding Shift will put it in the second.]])
 		if self.displayItem:UsesVersionedOrGroupedVariants() then
 			local rows = self.displayItem.versionList and #self.displayItem.versionList > 1 and 1 or 0
 			if self.displayItem.baseList and #self.displayItem.baseList then
-				rows += 1
+				rows = rows + (1)
 			end
 			if self.displayItem:HasIndependentVariants() then
 				rows = rows + (#self.displayItem.variantList > 1 and 1 or 0)
@@ -535,8 +535,8 @@ holding Shift will put it in the second.]])
 	end)
 	self.controls.displayItemVariant.y = function()
 		local y = 0
-		y += self.controls.displayItemBaseVariant:IsShown() and 24 or 0
-		y += self.controls.displayItemVersion:IsShown() and 24 or 0
+		y = y + (self.controls.displayItemBaseVariant:IsShown() and 24 or 0)
+		y = y + (self.controls.displayItemVersion:IsShown() and 24 or 0)
 		return y
 	end
 	self.controls.displayItemVariant.maxDroppedWidth = 1000

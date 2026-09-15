@@ -782,7 +782,7 @@ function PassiveTreeViewClass:Draw(build, viewPort, inputEvents)
 			connectorHandleQueue = { n = 0 }
 			self.connectorQueue[handleName] = connectorHandleQueue
 		end
-		connectorHandleQueue.n += 1
+		connectorHandleQueue.n = connectorHandleQueue.n + (1)
 		connectorHandleQueue[connectorHandleQueue.n] = connector
 	end
 
