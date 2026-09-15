@@ -114,11 +114,20 @@ local function flush_output(client)
 end
 
 local function get_version_meta()
+  if handlers and handlers.version then
+    local response = handlers.version({})
+    if response and response.version then
+      local meta = {}
+      for key, value in pairs(response.version) do meta[key] = value end
+      meta.mode = 'tcp'
+      return meta
+    end
+  end
   return {
     number     = _G.launch and launch.versionNumber  or '?',
     branch     = _G.launch and launch.versionBranch  or '?',
     platform   = _G.launch and launch.versionPlatform or '?',
-    apiVersion = '1.1.0',
+    apiVersion = '1.2.0',
     game       = 'poe2',
     mode       = 'tcp',
   }

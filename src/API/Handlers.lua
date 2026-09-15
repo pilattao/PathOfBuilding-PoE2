@@ -59,7 +59,7 @@ do
 end
 
 -- API version (semantic versioning)
-local API_VERSION = "1.1.0"
+local API_VERSION = "1.2.0"
 
 local function version_meta()
   return {
@@ -68,6 +68,7 @@ local function version_meta()
     platform    = _G.launch and launch.versionPlatform or '?',
     apiVersion  = API_VERSION,
     game        = "poe2",
+    features    = { queuedBuildOpen = true },
   }
 end
 
@@ -81,24 +82,24 @@ handlers.version = function(params)
   return { ok = true, version = version_meta() }
 end
 
+local function headless_open(params)
+  if not _G.runCallback then return {ok=false,error='headless frame callback unavailable'} end
+  local queued, err = BuildOps.open_build_xml(params)
+  if not queued then return {ok=false,error=err} end
+  runCallback('OnFrame')
+  local ready, readyErr = BuildOps.open_build_xml({statusOnly=true,requestId=queued.requestId})
+  if not ready then return {ok=false,error=readyErr} end
+  if not ready.ready then return {ok=false,error='headless build did not initialize'} end
+  return ready
+end
+
 handlers.new_build = function(params)
-  if not _G.newBuild then
-    return { ok = false, error = 'headless wrapper not initialized' }
-  end
-  _G.newBuild()
-  return { ok = true }
+  return headless_open(params or {})
 end
 
 handlers.load_build_xml = function(params)
-  if not params or type(params.xml) ~= 'string' then
-    return { ok = false, error = 'missing xml' }
-  end
-  local name = (params.name and tostring(params.name)) or 'API Build'
-  if not _G.loadBuildFromXML then
-    return { ok = false, error = 'headless wrapper not initialized' }
-  end
-  _G.loadBuildFromXML(params.xml, name)
-  return { ok = true, build_id = 1 }
+  if not params or type(params.xml) ~= 'string' then return {ok=false,error='missing xml'} end
+  return headless_open(params)
 end
 
 handlers.get_stats = function(params)
@@ -167,7 +168,13 @@ end
 handlers.open_build_xml = function(params)
   local res, err = BuildOps.open_build_xml(params or {})
   if not res then return { ok = false, error = err } end
-  return { ok = true }
+  return res
+end
+
+handlers.get_build_open_status = function(params)
+  local res, err = BuildOps.open_build_xml({statusOnly=true,requestId=params and params.requestId})
+  if not res then return {ok=false,error=err} end
+  return res
 end
 
 handlers.close_build = function(params)
@@ -489,95 +496,77 @@ end
 -- boolean state fields the import functions read before calling them.
 -- ---------------------------------------------------------------------------
 
+-- PoB2 DownloadCharacter decodes {character={...}} once. Its native import
+-- methods take that complete character as ONE argument. Split PoE1 responses
+-- must not be reshaped into empty PoB2 equipment/skill/jewel arrays.
+local function import_character_payload(params, section)
+  if not params or type(params.json) ~= 'string' then return nil,'missing json' end
+  local decoded, _, decodeErr = dkjson.decode(params.json)
+  if type(decoded) ~= 'table' then return nil,'invalid PoB2 character JSON: '..tostring(decodeErr) end
+  local character = type(decoded.character)=='table' and decoded.character or decoded
+  if type(character.name) ~= 'string' or type(character.class) ~= 'string' or type(character.level) ~= 'number' then
+    return nil,'complete PoB2 character payload required; PoE1 split responses are unsupported. Public snapshots use open_build_xml with pob_xml'
+  end
+  if character.level < 1 or character.level > 100 or character.level ~= math.floor(character.level) then return nil,'invalid PoB2 character level' end
+  local tree = build and build.spec and build.spec.tree
+  if not tree or not (tree.classNameMap[character.class] or tree.ascendNameMap[character.class] or tree.internalAscendNameMap[character.class]) then
+    return nil,'class is unavailable in the loaded PoB2 tree: '..character.class
+  end
+  if section=='passives' then
+    local passives = character.passives
+    if type(passives)~='table' or type(passives.hashes)~='table' or type(passives.specialisations)~='table'
+        or type(passives.skill_overrides)~='table' or type(character.jewels)~='table' then
+      return nil,'complete PoB2 passives, specialisations, skill_overrides and jewels are required'
+    end
+    passives.jewel_data = passives.jewel_data or {}
+  elseif type(character.equipment)~='table' or type(character.skills)~='table' then
+    return nil,'complete PoB2 equipment and skills arrays are required'
+  end
+  return character
+end
+
 handlers.import_passive_tree = function(params)
-  if not params or type(params.json) ~= 'string' then
-    return { ok = false, error = 'missing json' }
-  end
-  if not build or not build.importTab then
-    return { ok = false, error = 'build not initialized' }
-  end
-
-  local charData = params.char_data
-  if type(charData) ~= 'table' then
-    return { ok = false, error = 'missing char_data' }
-  end
-
-  -- Set the state on the existing control object rather than replacing it.
-  -- Replacing controls with plain tables breaks the Import tab UI (controls
-  -- lack IsShown() and other methods PoB calls when rendering the tab).
-  local clearJewels = params.clear_jewels ~= false
-  local ctrl = build.importTab.controls.charImportTreeClearJewels
-  if ctrl then ctrl.state = clearJewels end
-
-  -- PoB 3.29 changed the signature to ImportPassiveTreeAndJewels(charData, deleteJewels).
-  -- charData now carries the PARSED passives (charData.passives) and jewels
-  -- (charData.jewels = passives.items); the method reads charData.league directly and no
-  -- longer takes the raw JSON string or the global charSelectLeague. Mirror PoB's own
-  -- DownloadPassiveTree flow (Classes/ImportTab.lua): decode the passive-skills JSON and
-  -- attach it to charData before the call.
-  local passivesTable, _, decErr = dkjson.decode(params.json)
-  if type(passivesTable) ~= 'table' then
-    return { ok = false, error = 'failed to decode passives json: ' .. tostring(decErr) }
-  end
-  charData.passives = passivesTable
-  charData.jewels = passivesTable.items
-
-  local ok, err = pcall(build.importTab.ImportPassiveTreeAndJewels, build.importTab, charData, clearJewels)
-  if not ok then
-    return { ok = false, error = 'import_passive_tree exception: ' .. tostring(err) }
-  end
-
-  local info, infoErr = BuildOps.get_build_info()
-  if not info then return { ok = false, error = infoErr } end
-  BuildOps.get_main_output()
-  return {
-    ok            = true,
-    status        = 'Passive tree imported',
-    level         = info.level,
-    className     = info.className,
-    ascendClassName = info.ascendClassName,
-  }
+  if not build or not build.importTab then return {ok=false,error='build not initialized'} end
+  local character, err = import_character_payload(params,'passives')
+  if not character then return {ok=false,error=err} end
+  local control = build.importTab.controls.charImportTreeClearJewels
+  if control then control.state = params.clear_jewels ~= false end
+  local ok, importErr = pcall(build.importTab.ImportPassiveTreeAndJewels,build.importTab,character)
+  if not ok then return {ok=false,error='import_passive_tree exception: '..tostring(importErr)} end
+  local output, calcErr = BuildOps.get_main_output()
+  if not output then return {ok=false,error=calcErr} end
+  local info = BuildOps.get_build_info()
+  return {ok=true,status='Passive tree imported',level=info.level,className=info.className,ascendClassName=info.ascendClassName}
 end
 
 handlers.import_items_skills = function(params)
-  if not params or type(params.json) ~= 'string' then
-    return { ok = false, error = 'missing json' }
-  end
-  if not build or not build.importTab then
-    return { ok = false, error = 'build not initialized' }
-  end
+  if not build or not build.importTab then return {ok=false,error='build not initialized'} end
+  local character, err = import_character_payload(params,'equipment')
+  if not character then return {ok=false,error=err} end
+  local controls = build.importTab.controls
+  if controls.charImportItemsClearItems then controls.charImportItemsClearItems.state = params.clear_items ~= false end
+  if controls.charImportItemsClearSkills then controls.charImportItemsClearSkills.state = params.clear_skills ~= false end
+  if controls.charImportItemsIgnoreWeaponSwap then controls.charImportItemsIgnoreWeaponSwap.state = params.ignore_weapon_swap == true end
+  local ok, importErr = pcall(build.importTab.ImportItemsAndSkills,build.importTab,character)
+  if not ok then return {ok=false,error='import_items_skills exception: '..tostring(importErr)} end
+  local output, calcErr = BuildOps.get_main_output()
+  if not output then return {ok=false,error=calcErr} end
+  return {ok=true,status='Items and skills imported',level=build.characterLevel,character=character}
+end
 
-  -- Set state on existing controls rather than replacing them (see import_passive_tree).
-  local ctrls = build.importTab.controls
-  if ctrls.charImportItemsClearItems       then ctrls.charImportItemsClearItems.state       = params.clear_items ~= false end
-  if ctrls.charImportItemsClearSkills      then ctrls.charImportItemsClearSkills.state      = params.clear_skills ~= false end
-  if ctrls.charImportItemsIgnoreWeaponSwap then ctrls.charImportItemsIgnoreWeaponSwap.state = params.ignore_weapon_swap == true end
-
-  -- PoB 3.29 changed the signature to
-  -- ImportItemsAndSkills(charData, clearItems, clearSkills, ignoreWeaponSwap), where charData
-  -- carries the equipment (charData.equipment = items). It no longer takes the raw JSON
-  -- string. The get-items API response has both `.items` and `.character`; mirror PoB's own
-  -- DownloadItems flow. (The clear controls above are now redundant with the args but harmless.)
-  local resp, _, decErr = dkjson.decode(params.json)
-  if type(resp) ~= 'table' then
-    return { ok = false, error = 'failed to decode items json: ' .. tostring(decErr) }
+-- TcpServer refreshes _G.build from a reusable BUILD object, including while
+-- Main has queued a transition. Refuse operations on that stale build.
+local transitionSafe = {ping=true,version=true,open_build_xml=true,get_build_open_status=true,
+  new_build=true,load_build_xml=true,close_build=true,get_gem_detail=true}
+for name, handler in pairs(handlers) do
+  if not transitionSafe[name] then
+    handlers[name] = function(params)
+      local mainObj = _G.main or (_G.__mainObject__ and __mainObject__.main)
+      if mainObj and mainObj.newMode then return {ok=false,error='native build transition pending'} end
+      if mainObj and mainObj.mode and mainObj.mode~='BUILD' then return {ok=false,error='no active native build'} end
+      return handler(params)
+    end
   end
-  local charData = (type(resp.character) == 'table') and resp.character or {}
-  charData.equipment = resp.items
-
-  local ok, ret = pcall(build.importTab.ImportItemsAndSkills, build.importTab, charData,
-    params.clear_items ~= false, params.clear_skills ~= false, params.ignore_weapon_swap == true)
-  if not ok then
-    return { ok = false, error = 'import_items_skills exception: ' .. tostring(ret) }
-  end
-
-  BuildOps.get_main_output()
-  return {
-    ok        = true,
-    status    = 'Items and skills imported',
-    level     = (type(ret) == 'table' and ret.level) or (type(charData) == 'table' and charData.level) or nil,
-    character = (type(ret) == 'table' and ret) or charData,
-  }
 end
 
 return {

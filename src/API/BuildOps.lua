@@ -231,38 +231,114 @@ function M.close_build()
   return nil, 'main:SetMode not available'
 end
 
--- Open an existing build XML into PoB's GUI (TCP mode: makes it the active build).
--- Pass xml=nil (or omit) to create a brand-new empty build using PoB's own defaults.
-function M.open_build_xml(params)
-  if not _G.main or not main.SetMode then
-    return nil, 'main:SetMode not available (headless mode?)'
-  end
-  local path = (type(params) == 'table' and params.path) or ''
-  local xml  = (type(params) == 'table' and type(params.xml) == 'string') and params.xml or nil
+-- Main:SetMode queues Build:Init for the next frame. Keep an operation token so
+-- callers cannot mistake the previous build for a successful open.
+local openRequest, openSequence
+openSequence = 0
 
-  -- BuildMode:Init(dbFileName, buildName, buildXML, ...)
-  -- dbFileName = nil  → new unsaved build
-  -- buildName must be non-nil or Init() immediately returns to LIST mode
-  -- BuildMode:Init(dbFileName, buildName, buildXML, ...)
-  -- dbFileName = false → new/unsaved build (matches how PoB itself creates new builds)
-  -- dbFileName = path  → loading from file
-  local buildName = (type(params) == 'table' and params.name) or 'New Build'
-  if xml then
-    if path ~= '' then
-      main:SetMode('BUILD', path, buildName, xml)
-    else
-      main:SetMode('BUILD', false, buildName, xml)
+local function settle_open(mainObj)
+  local request = openRequest
+  if not request then return nil, 'no build open request' end
+  if request.error then return nil, request.error end
+  if request.ready then return request end
+  if mainObj.newMode then
+    if mainObj.newMode == 'BUILD' then return {ok=true,ready=false,requestId=request.requestId} end
+    request.error = 'build open failed: native mode changed to ' .. tostring(mainObj.newMode)
+    return nil,request.error
+  end
+  if mainObj.mode ~= 'BUILD' then
+    request.error = 'build open failed: no active BUILD mode'
+    return nil,request.error
+  end
+  local candidate = mainObj.modes and mainObj.modes.BUILD
+  if not candidate or not candidate.spec or not candidate.calcsTab or not candidate.importTab then
+    return {ok=true,ready=false,requestId=request.requestId}
+  end
+  if candidate.buildName ~= request.name then
+    request.error = 'build open was superseded by a different build'
+    return nil,request.error
+  end
+  if candidate.targetVersion ~= liveTargetVersion then
+    request.error = 'build open requires native version conversion; initialization is incomplete'
+    return nil,request.error
+  end
+  if candidate.abortSave then return {ok=true,ready=false,requestId=request.requestId} end
+  _G.build = candidate
+  local ok, err = pcall(function()
+    if request.classId ~= nil then
+      -- Resolve against the installed tree before opening; never use PoE1 IDs
+      -- or reconstruct a loaded XML. This runs only for a new empty build.
+      candidate.spec:ImportFromNodeList(nil, request.classId, request.ascendClassId, 0,
+        {}, {}, {}, {}, request.treeVersion)
+      if candidate.spec.curClassId ~= request.classId or candidate.spec.curAscendClassId ~= request.ascendClassId then
+        error('PoB2 did not select the requested class/ascendancy')
+      end
+      candidate.spec:SetWindowTitleWithBuildClass()
+      candidate:UpdateClassDropdowns(request.treeVersion)
+      candidate.modFlag, candidate.buildFlag = true,true
     end
-  else
-    main:SetMode('BUILD', false, buildName)
-  end
+    local output, calcErr = M.get_main_output()
+    if not output then error(calcErr) end
+  end)
+  if not ok then request.error = 'build open failed: ' .. tostring(err); return nil,request.error end
+  request.ready = true
+  request.info = M.get_build_info()
+  return {ok=true,ready=true,requestId=request.requestId,info=request.info}
+end
 
-  -- Refresh _G.build reference (may take a frame or two to fully initialize).
-  if main.modes and main.modes['BUILD'] then
-    _G.build = main.modes['BUILD']
+-- statusOnly is used by the get_build_open_status handler; all other calls queue
+-- a new open. XML is parsed for validation and then passed to PoB byte-for-byte.
+function M.open_build_xml(params)
+  local mainObj = _G.main or (_G.__mainObject__ and __mainObject__.main)
+  if not mainObj or not mainObj.SetMode then return nil,'main:SetMode not available' end
+  params = params or {}
+  if params.statusOnly then
+    if not openRequest or params.requestId ~= openRequest.requestId then return nil,'unknown build open requestId' end
+    return settle_open(mainObj)
   end
-  local ready = not main.newMode and _G.build and _G.build.calcsTab and _G.build.importTab and true or false
-  return { ok = true, ready = ready }
+  if mainObj.newMode then return nil,'a native mode transition is already pending' end
+  if openRequest and not openRequest.ready and not openRequest.error then
+    local state, err = settle_open(mainObj)
+    if state and not state.ready then return nil,'a build open is already pending' end
+    -- A terminal failure is reported to its original token; a fresh open may recover.
+  end
+  local xml = params.xml
+  if xml ~= nil then
+    if type(xml) ~= 'string' or not xml:match('%S') then return nil,'nonempty build XML required' end
+    if params.className ~= nil or params.ascendancy ~= nil then return nil,'class overrides are only valid for a blank build' end
+    local document, err = common.xml.ParseXML(xml)
+    if err or not document or #document ~= 1 or not document[1] or document[1].elem ~= 'PathOfBuilding2' then
+      return nil,'invalid PoB2 XML: ' .. tostring(err or 'PathOfBuilding2 root required; use the pob_xml field of a public export')
+    end
+    for _,node in ipairs(document[1]) do
+      if type(node)=='table' and node.elem=='Build' and (node.attrib.targetVersion or legacyTargetVersion) ~= liveTargetVersion then
+        return nil,'build targetVersion requires native conversion; open it in PoB2 first'
+      end
+    end
+  end
+  local name, path = params.name or 'New Build', params.path or ''
+  if type(name) ~= 'string' or not name:match('%S') then return nil,'nonempty build name required' end
+  if type(path) ~= 'string' then return nil,'invalid build path' end
+  if not xml and path ~= '' then return nil,'blank builds cannot have a file path' end
+  local classId, ascendId
+  if params.ascendancy ~= nil and params.className == nil then return nil,'className is required with ascendancy' end
+  if params.className ~= nil then
+    if type(params.className) ~= 'string' then return nil,'invalid className' end
+    local tree = mainObj:LoadTree(latestTreeVersion)
+    classId = tree.classNameMap[params.className]
+    if classId == nil then return nil,'class is not available in the installed PoB2 tree: '..params.className end
+    ascendId = 0
+    if params.ascendancy ~= nil and params.ascendancy ~= 'None' then
+      if type(params.ascendancy) ~= 'string' then return nil,'invalid ascendancy' end
+      local asc = tree.ascendNameMap[params.ascendancy] or tree.internalAscendNameMap[params.ascendancy]
+      if not asc or asc.classId ~= classId then return nil,'ascendancy does not belong to '..params.className..': '..params.ascendancy end
+      ascendId = asc.ascendClassId
+    end
+  end
+  openSequence = openSequence + 1
+  openRequest = {requestId=tostring(openSequence),name=name,classId=classId,ascendClassId=ascendId,treeVersion=latestTreeVersion}
+  mainObj:SetMode('BUILD',path ~= '' and path or false,name,xml)
+  return {ok=true,ready=false,requestId=openRequest.requestId}
 end
 
 function M.export_build_xml()
@@ -338,6 +414,7 @@ end
 
 -- Basic build info
 function M.get_build_info()
+  if _G.main and (main.newMode or (main.mode and main.mode ~= 'BUILD')) then return nil,'no ready build; native mode transition pending or build list active' end
   if not build then return nil, 'build not initialized' end
   local spec = build.spec
   -- build.buildClassName / build.buildAscendName are not real PoB fields (never defined
