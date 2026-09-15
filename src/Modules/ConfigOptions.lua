@@ -53,6 +53,35 @@ local function questModsRewards(source, line, modList)
 	end
 end
 
+local function resolveQuestRewardChoice(options, value)
+	if type(value) ~= "string" or value == "None" then
+		return
+	end
+	-- Preserve an exact choice even if another option has equivalent whitespace.
+	for _, option in ipairs(options) do
+		if option == value then
+			return option
+		end
+	end
+
+	-- XML readers may replace literal newlines/tabs in attributes with spaces.
+	-- Recover line boundaries only from one known option, never from arbitrary text.
+	local function normalizeWhitespace(text)
+		return text:gsub("%s+", " "):match("^%s*(.-)%s*$")
+	end
+	local normalized = normalizeWhitespace(value)
+	local matchedOption
+	for _, option in ipairs(options) do
+		if normalizeWhitespace(option) == normalized then
+			if matchedOption and matchedOption ~= option then
+				return -- Ambiguous alias: do not choose a reward for the user.
+			end
+			matchedOption = option
+		end
+	end
+	return matchedOption
+end
+
 local function addQuestModsRewardsConfigOptions(configSettings)
 	table.insert(configSettings, { section = "Quest Rewards", col = 3 })
 
@@ -96,10 +125,11 @@ local function addQuestModsRewardsConfigOptions(configSettings)
 				defaultIndex = 1,
 				tooltip = "^x88FFFF" .. quest.Info .. "^7\nOne of the following:\n" .. table.concat(quest.Options, "\n"),
 				apply = function(val, modList, enemyModList)
-				if val == "None" then
-					return
-				end
-				applyModsFromString(source, val, modList)
+					local option = resolveQuestRewardChoice(quest.Options, val)
+					if option then
+						-- Resolve for calculation only; keep the original config/XML input.
+						applyModsFromString(source, option, modList)
+					end
 				end
 			})
 		end

@@ -59,10 +59,22 @@ local function gemInfo(g,index)
     level=g.level,quality=g.quality,count=g.count,enabled=g.enabled,corrupted=g.corrupted,
     enableGlobal1=g.enableGlobal1,enableGlobal2=g.enableGlobal2,support=isSupport(g),
     statSet=plain(g.statSet),statSetCalcs=plain(g.statSetCalcs),skillPart=g.skillPart,skillPartCalcs=g.skillPartCalcs}
+  local ge=effect(g)
+  local level=ge and ge.levels and ge.levels[g.level]
+  if level then
+    local baseCosts={}
+    for resource,value in pairs(level.cost or {}) do if number(value) then baseCosts[resource]=value end end
+    if next(baseCosts) then r.baseCosts=baseCosts end
+    if number(level.cooldown) then r.baseCooldown=level.cooldown end
+  end
   return r
 end
 local fields={'CombinedDPS','TotalDPS','FullDPS','FullDotDPS','AverageDamage','Speed','HitSpeed',
-  'ManaCost','ManaCostPerSecond','ManaPercentCost','LifeCost','LifeCostPerSecond','LifePercentCost','ESCost','RageCost',
+  'ManaCost','ManaPerSecondCost','ManaPercentCost','ManaPercentPerSecondCost','UnreservedManaPercentCost',
+  'LifeCost','LifePerSecondCost','LifePercentCost','LifePercentPerSecondCost',
+  'ESCost','ESPerSecondCost','ESPercentCost','ESPercentPerSecondCost','RageCost','RagePerSecondCost','SoulCost',
+  'WardCost','WardPerSecondCost','WardPercentCost','WardPercentPerSecondCost','Cooldown','CastRate','HitTime',
+  'Ward','WardRegen','WardRegenRecovery','WardRechargeDelay',
   'Life','LifeUnreserved','Mana','ManaUnreserved','Spirit','SpiritUnreserved','NetManaRegen','EnergyShield','TotalEHP',
   'Armour','Evasion','BlockChance','DeflectChance','FireResist','ColdResist','LightningResist','ChaosResist',
   'PhysicalMaximumHitTaken','FireMaximumHitTaken','ColdMaximumHitTaken','LightningMaximumHitTaken','ChaosMaximumHitTaken',
@@ -100,6 +112,25 @@ local function conditions(b,group,evaluationGroup)
     itemSetId=b.itemsTab.activeItemSetId,useSecondWeaponSet=b.itemsTab.activeItemSet.useSecondWeaponSet==true,
     treeSpecId=b.treeTab and b.treeTab.activeSpec,treeVersion=b.spec and b.spec.treeVersion}
 end
+-- Report missing runtime resource calculations, never substitute raw gem costs
+-- for modified costs. Older installations can know Ward gem data but omit Ward
+-- from CalcOffence's resource loop.
+local function resourceCoverage(env)
+  local notes={}
+  local selected=env.player.mainSkill
+  local active=selected and selected.activeEffect
+  local ge=active and active.grantedEffect
+  local level=active and (active.grantedEffectLevel or ge and ge.levels and ge.levels[active.level or active.srcInstance and active.srcInstance.level])
+  local waived=selected and selected.skillModList and selected.skillModList:Flag(selected.skillCfg,'HasNoCost')
+  if waived then return {'Native HasNoCost is active; the calculator may omit waived cost fields.'},false end
+  for resource,value in pairs(level and level.cost or {}) do
+    local field=resource:gsub('PerMinute','PerSecond')..'Cost'
+    if resource:match('^Ward') and number(value) and value>0 and not number(env.player.output[field]) then
+      notes[#notes+1]='Native runtime did not calculate '..field..'; base gem data is not a modified cost. A calculator with Ward resource support is required.'
+    end
+  end
+  return notes,#notes>0
+end
 local function issues(group,env,b)
   local supports,warnings={},{}
   for i,g in ipairs(group.gemList) do
@@ -119,7 +150,7 @@ local function issues(group,env,b)
     if g.enabled~=false and number(g.reqLevel) and g.reqLevel>b.characterLevel then warnings[#warnings+1]=g.nameSpec..': character level requirement '..g.reqLevel end
   end
   local out=env.player.output
-  for _,key in ipairs({'ManaCostWarning','LifeCostWarning','ESCostWarning','RageCostWarning','EternalLifeWarning'}) do
+  for _,key in ipairs({'ManaCostWarning','LifeCostWarning','ESCostWarning','RageCostWarning','WardCostWarning','EternalLifeWarning'}) do
     if out[key]==true then warnings[#warnings+1]=key end
   end
   if number(out.SpiritUnreserved) and out.SpiritUnreserved<0 then warnings[#warnings+1]='Spirit reservation exceeds available Spirit' end
@@ -141,6 +172,8 @@ local function evaluate(b,p,ops)
   local groupIndex=integer(p.groupIndex,1);local originalGroup=groupIndex and tab.socketGroupList[groupIndex]
   if not originalGroup then error('invalid groupIndex') end
   if originalGroup.enabled==false then error('selected group is disabled') end
+  if p.resourceOnly~=nil and type(p.resourceOnly)~='boolean' then error('resourceOnly must be boolean') end
+  if p.resourceOnly and p.search then error('resourceOnly is for explicit setup comparisons, not ranking search') end
   if p.metric and not metrics[p.metric] then error('unsupported native ranking metric') end
   if p.setups and p.search then error('provide setups or search, not both') end
   if p.search then
@@ -320,12 +353,14 @@ local function evaluate(b,p,ops)
       end
       local output=outputs(env.player.output)
       local supports,warnings,valid=issues(group,env,b)
+      local resourceNotes,incompleteResources=resourceCoverage(env)
+      if incompleteResources then valid=false end
       if not selected.displaySkillList or #selected.displaySkillList==0 then valid=false;warnings[#warnings+1]='No active skill in the evaluation group' end
       if group.slotEnabled==false then warnings[#warnings+1]='Group is disabled in the current weapon set' end
       local info={};for i,g in ipairs(gems) do info[i]=gemInfo(g,i) end
       local selected=tab.socketGroupList[evaluationIndex]
       return {name=name,gems=info,output=output,deltas=deltas(output,baseline),supports=supports,
-        warnings=warnings,valid=valid and number(output[metric]),metric=metric,
+        warnings=warnings,resourceNotes=resourceNotes,valid=valid and (p.resourceOnly==true or number(output[metric])),metric=metric,
         selection={groupIndex=evaluationIndex,mainActiveSkill=selected and selected.mainActiveSkill,
           mainActiveSkillCalcs=selected and selected.mainActiveSkillCalcs},_specs=specs}
     end)
@@ -356,8 +391,8 @@ local function evaluate(b,p,ops)
     local mainEffect=baselineEnv.player.mainSkill and baselineEnv.player.mainSkill.activeEffect
     selectedEffectId=mainEffect and mainEffect.grantedEffect.id
     selectedRef=mainEffect and isValueInArray(tab.socketGroupList[evaluationIndex].gemList,mainEffect.srcInstance)
-    metric=p.metric or (number(baseline.MinionCombinedDPS) and 'MinionCombinedDPS' or 'CombinedDPS')
-    if not number(baseline[metric]) then error('native baseline metric unavailable: '..metric) end
+    metric=p.resourceOnly and 'resource-only' or p.metric or (number(baseline.MinionCombinedDPS) and 'MinionCombinedDPS' or 'CombinedDPS')
+    if not p.resourceOnly and not number(baseline[metric]) then error('native baseline metric unavailable: '..metric) end
     if not p.search then
       for _,setup in ipairs(p.setups) do
         if type(setup.name)~='string' or #setup.name==0 or #setup.name>160 then error('invalid setup name') end
@@ -431,7 +466,7 @@ local function evaluate(b,p,ops)
     end
     for _,row in ipairs(trialResults) do
       local rightSize=not p.search or p.search.mode~='optimize' or row.gems and #row.gems==p.search.targetGemCount
-      if row.valid and rightSize then ranking[#ranking+1]=row end
+      if not p.resourceOnly and row.valid and rightSize then ranking[#ranking+1]=row end
     end
     table.sort(ranking,better)
   end)

@@ -442,6 +442,7 @@ function M.get_build_info()
   end
   local info = {
     name = build.buildName,
+    fileName = type(build.dbFileName) == 'string' and build.dbFileName or nil,
     level = build.characterLevel,
     className = className,
     ascendClassName = ascendClassName,
@@ -572,63 +573,23 @@ function M.update_tree_delta(params)
 end
 
 
--- Calculate what-if scenario without persisting changes
--- params: { addNodes?: number[], removeNodes?: number[], masteryEffects?: {[id]=effectId}, useFullDPS?: boolean }
+-- Calculate a detached native passive scenario; no live tree/undo/cache edits.
+-- params: { expectedBuildName?, expectedXml?, weaponSet?:1|2, weaponSets?:{[nodeId]=0|1|2},
+--   attributeOverrides?:{[nodeId]='str'|'dex'|'int'}, addNodes?, removeNodes?,
+--   masteryEffects?, useFullDPS? }
+local treeEvaluator
 function M.calc_with(params)
-  if not build or not build.calcsTab or not build.spec then return nil, 'build not initialized' end
-  params = params or {}
-  local spec, override, patches = build.spec, {}, {}
-  for _,operation in ipairs({'addNodes','removeNodes'}) do
-    if params[operation] then
-      if type(params[operation]) ~= 'table' then return nil,operation .. ' must be an array' end
-      local nodes = {}
-      for _,value in ipairs(params[operation]) do
-        local id = integer(value,1)
-        local node = id and (spec.nodes[id] or spec.nodes[tostring(id)])
-        if not node then return nil,'passive node not found: '..tostring(value) end
-        local allocated = spec.allocNodes[node.id] ~= nil
-        if (operation == 'addNodes' and not allocated) or (operation == 'removeNodes' and allocated) then nodes[node] = true end
-      end
-      if next(nodes) then override[operation] = nodes end
-    end
+  if not treeEvaluator then
+    local source = debug and debug.getinfo and debug.getinfo(1, 'S').source or ''
+    local ok, evaluator = pcall(function()
+      return source:sub(1,1) == '@'
+        and dofile(source:sub(2):gsub('[^/\\]+$', '') .. 'TreeEvaluator.lua')
+        or require('API.TreeEvaluator')
+    end)
+    if not ok then return nil, 'Native tree evaluator unavailable: '..tostring(evaluator) end
+    treeEvaluator = evaluator
   end
-  if params.masteryEffects then
-    if type(params.masteryEffects) ~= 'table' then return nil,'masteryEffects must be a map' end
-    for key,value in pairs(params.masteryEffects) do
-      local node = spec.nodes[tonumber(key)]
-      local effect = spec.tree and spec.tree.masteryEffects and spec.tree.masteryEffects[tonumber(value)]
-      if not node or not effect then return nil,'mastery effect is unavailable in this PoB2 tree' end
-      if not spec.allocNodes[node.id] and not (override.addNodes and override.addNodes[node]) then
-        return nil,'mastery must be allocated or included in addNodes'
-      end
-      table.insert(patches,{node=node,effect=effect})
-    end
-  end
-  local view, saved = build.viewMode, {}
-  local ok, out, baseOut = pcall(function()
-    local calculator, baseline = build.calcsTab:GetMiscCalculator()
-    if not calculator then error('PoB2 misc calculator unavailable; rebuild the build first') end
-    if not next(override) and #patches == 0 then return baseline,baseline end
-    for _,patch in ipairs(patches) do
-      local node = patch.node
-      saved[node] = copyTable(node,true)
-      -- ProcessStats can rewrite sd, mods, modKey and modList. Do not mutate the
-      -- shared effect description and restore every node field even if parsing throws.
-      node.sd = copyTable(patch.effect.sd)
-      spec.tree:ProcessStats(node)
-    end
-    build.viewMode = 'CALCULATOR'
-    local result = calculator(override,params.useFullDPS == true)
-    if not result then error('PoB2 calculator returned no output') end
-    return result,baseline
-  end)
-  build.viewMode = view
-  for node,state in pairs(saved) do
-    wipeTable(node)
-    for k,v in pairs(state) do node[k] = v end
-  end
-  if not ok then return nil,tostring(out) end
-  return out,baseOut
+  return treeEvaluator.evaluate(build, params)
 end
 
 
@@ -1801,6 +1762,18 @@ end
 -- ============================================================
 -- Anointment evaluation
 -- ============================================================
+
+-- Item comparisons have their own helper/deployment payload, independent of gem evaluation.
+local itemEvaluator
+function M.evaluate_item_replacements(params)
+  if not itemEvaluator then
+    local source = debug and debug.getinfo and debug.getinfo(1, 'S').source or ''
+    itemEvaluator = source:sub(1,1) == '@'
+      and dofile(source:sub(2):gsub('[^/\\]+$', '') .. 'ItemEvaluator.lua')
+      or require('API.ItemEvaluator')
+  end
+  return itemEvaluator.evaluate(build, params)
+end
 
 function M.evaluate_anoint_candidates(params)
   if not build or not build.itemsTab or not build.calcsTab then return nil, 'build not initialized' end

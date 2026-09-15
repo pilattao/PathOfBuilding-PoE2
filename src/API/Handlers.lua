@@ -59,7 +59,7 @@ do
 end
 
 -- API version (semantic versioning)
-local API_VERSION = "1.3.0"
+local API_VERSION = "1.4.0"
 
 local function version_meta()
   return {
@@ -68,7 +68,7 @@ local function version_meta()
     platform    = _G.launch and launch.versionPlatform or '?',
     apiVersion  = API_VERSION,
     game        = "poe2",
-    features    = { queuedBuildOpen = true, nativeGemEvaluation = true },
+    features    = { queuedBuildOpen = true, nativeGemEvaluation = true, nativeItemEvaluation = true, nativeTreeEvaluation = true },
   }
 end
 
@@ -244,18 +244,27 @@ end
 handlers.calc_with = function(params)
   local out, base = BuildOps.calc_with(params or {})
   if not out then return { ok = false, error = base } end
-  -- Slim down to JSON-safe scalar fields only (full output has functions/userdata)
-  local slim = {
-    CombinedDPS   = out.CombinedDPS,
-    TotalDPS      = out.TotalDPS,
-    AverageDamage = out.AverageDamage,
-    Life          = out.Life,
-    TotalEHP      = out.TotalEHP,
-    EnergyShield  = out.EnergyShield,
-  }
-  local minion = type(out.Minion) == 'table' and out.Minion or nil
-  if minion then
-    slim.Minion = { CombinedDPS = minion.CombinedDPS, TotalDPS = minion.TotalDPS }
+  -- Native output also includes functions and opaque objects. Preserve every
+  -- finite measurement (including zero), but only the known context fields.
+  local function finite(value)
+    return type(value) == 'number' and value == value and value ~= math.huge and value ~= -math.huge
+  end
+  local slim = {}
+  for key, value in pairs(out) do
+    if finite(value) then slim[key] = value end
+  end
+  if type(out.Minion) == 'table' then
+    slim.Minion = {}
+    for key, value in pairs(out.Minion) do
+      if finite(value) then slim.Minion[key] = value; slim['Minion' .. key] = value end
+    end
+  end
+  if type(out.calculationContext) == 'table' then
+    local context = out.calculationContext
+    slim.calculationContext = {
+      weaponSet = context.weaponSet,
+      treeVersion = context.treeVersion,
+    }
   end
   return { ok = true, output = slim }
 end
@@ -468,6 +477,12 @@ handlers.probe_stat_weights = function(params)
     evaluated = res.evaluated,
     failed    = res.failed,
   }
+end
+
+handlers.evaluate_item_replacements = function(params)
+  local result, err = BuildOps.evaluate_item_replacements(params or {})
+  if not result then return { ok = false, error = err } end
+  return { ok = true, result = result }
 end
 
 handlers.evaluate_anoint_candidates = function(params)

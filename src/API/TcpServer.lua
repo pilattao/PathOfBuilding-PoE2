@@ -127,7 +127,7 @@ local function get_version_meta()
     number     = _G.launch and launch.versionNumber  or '?',
     branch     = _G.launch and launch.versionBranch  or '?',
     platform   = _G.launch and launch.versionPlatform or '?',
-    apiVersion = '1.3.0',
+    apiVersion = '1.4.0',
     game       = 'poe2',
     mode       = 'tcp',
   }
